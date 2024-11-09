@@ -69,6 +69,8 @@ struct Selective_Scan_fwd_kernel_traits {
     static constexpr int kSmemSize = kSmemIOSize + sizeof(typename BlockScanT::TempStorage);
 };
 
+#define T_COUNT 4 //MODIFY:
+
 template<typename Ktraits>
 __global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks)
 void selective_scan_fwd_kernel(SSMParamsBase params) {
@@ -149,18 +151,24 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
         u += kChunkSize;
         delta += kChunkSize;
     
-        float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
+        float delta_vals[T_COUNT][kNRows][kNItems], delta_u_vals[T_COUNT][kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
             #pragma unroll
             for (int i = 0; i < kNItems; ++i) {
-                float u_val = float(u_vals[r][i]);
-                delta_vals[r][i] = float(delta_vals_load[r][i]) + delta_bias[r];
-                if (params.delta_softplus) {
-                    delta_vals[r][i] = delta_vals[r][i] <= 20.f ? log1pf(expf(delta_vals[r][i])) : delta_vals[r][i];
+
+                int tv = 1; //MODIFY: start with 1 as the modifier
+                #pragma unroll
+                for (int ti = 0; ti < T_COUNT; ++ti) { //MODIFY: increment the index ti
+                    float u_val = float(u_vals[r][i]);
+                    delta_vals[ti][r][i] = float(delta_vals_load[r][i])/tv + delta_bias[r]; //MODIFY: compute delta / tv
+                    if (params.delta_softplus) {
+                        delta_vals[ti][r][i] = delta_vals[ti][r][i] <= 20.f ? log1pf(expf(delta_vals[ti][r][i])) : delta_vals[ti][r][i];
+                    }
+                    delta_u_vals[ti][r][i] = delta_vals[ti][r][i] * u_val;
+                    out_vals[r][i] += D_val[r] * u_val; //MODIFY: I assume uval, D_val do not vary for different delta t's - as such, we can just repeatedly add them to out_vals
+                    tv*=2; //MODIFY: multiply modifier
                 }
-                delta_u_vals[r][i] = delta_vals[r][i] * u_val;
-                out_vals[r][i] = D_val[r] * u_val;
             }
         }
 
@@ -213,59 +221,62 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
 
             #pragma unroll
             for (int r = 0; r < kNRows; ++r) {
-                if (r > 0) { __syncthreads(); }  // Scan could be using the same smem
-                scan_t thread_data[kNItems];
                 #pragma unroll
-                for (int i = 0; i < kNItems; ++i) {
-                    if constexpr (!kIsComplex) {
-                        thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]),
-                                                     !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
-                        if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
-                            if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
-                                thread_data[i] = make_float2(1.f, 0.f);
+                for (int ti = 0; ti < T_COUNT; ++ti){ //MODIFY: loop over the delta t's
+                    if (r > 0) { __syncthreads(); }  // Scan could be using the same smem
+                    scan_t thread_data[kNItems];
+                    #pragma unroll
+                    for (int i = 0; i < kNItems; ++i) {
+                        if constexpr (!kIsComplex) {
+                            thread_data[i] = make_float2(exp2f(delta_vals[ti][r][i] * A_val[r]),
+                                                        !kIsVariableB ? delta_u_vals[ti][r][i] : B_vals[i] * delta_u_vals[ti][r][i]); //MODIFY:
+                            if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
+                                if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
+                                    thread_data[i] = make_float2(1.f, 0.f);
+                                }
                             }
-                        }
-                    } else {
-                        // Pytorch's implementation of complex exp (which calls thrust) is very slow
-                        complex_t delta_a_exp = cexp2f(delta_vals[r][i] * A_val[r]);
-                        weight_t B_delta_u_val = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];
-                        thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, B_delta_u_val.real_, B_delta_u_val.imag_);
-                        if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
-                            if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
-                                thread_data[i] = make_float4(1.f, 0.f, 0.f, 0.f);
+                        } else {
+                            // Pytorch's implementation of complex exp (which calls thrust) is very slow
+                            complex_t delta_a_exp = cexp2f(delta_vals[ti][r][i] * A_val[r]);
+                            weight_t B_delta_u_val = !kIsVariableB ? delta_u_vals[ti][r][i] : B_vals[i] * delta_u_vals[ti][r][i]; //MODIFY:
+                            thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, B_delta_u_val.real_, B_delta_u_val.imag_);
+                            if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
+                                if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
+                                    thread_data[i] = make_float4(1.f, 0.f, 0.f, 0.f);
+                                }
                             }
                         }
                     }
-                }
-                // Initialize running total
-                scan_t running_prefix;
-                if constexpr (!kIsComplex) {
-                    // If we use WARP_SCAN then all lane 0 of all warps (not just thread 0) needs to read
-                    running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float2(1.f, 0.f);
-                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float2(1.f, 0.f);
-                } else {
-                    running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float4(1.f, 0.f, 0.f, 0.f);
-                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
-                }
-                SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
-                typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
-                    thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
-                );
-                // There's a syncthreads in the scan op, so we don't need to sync here.
-                // Unless there's only 1 warp, but then it's the same thread (0) reading and writing.
-                if (threadIdx.x == 0) {
-                    smem_running_prefix[state_idx] = prefix_op.running_prefix;
-                    x[(r * params.n_chunks + chunk) * params.dstate + state_idx] = prefix_op.running_prefix;
-                }
-                #pragma unroll
-                for (int i = 0; i < kNItems; ++i) {
-                    const weight_t C_val = !kIsVariableC
-                        ? BC_val[r]
-                        : (!kIsVariableB ? BC_val[r] * C_vals[i] : C_vals[i]);
+                    // Initialize running total
+                    scan_t running_prefix;
                     if constexpr (!kIsComplex) {
-                        out_vals[r][i] += thread_data[i].y * C_val;
+                        // If we use WARP_SCAN then all lane 0 of all warps (not just thread 0) needs to read
+                        running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float2(1.f, 0.f);
+                        // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float2(1.f, 0.f);
                     } else {
-                        out_vals[r][i] += (complex_t(thread_data[i].z, thread_data[i].w) * C_val).real_ * 2;
+                        running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float4(1.f, 0.f, 0.f, 0.f);
+                        // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
+                    }
+                    SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
+                    typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
+                        thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
+                    );
+                    // There's a syncthreads in the scan op, so we don't need to sync here.
+                    // Unless there's only 1 warp, but then it's the same thread (0) reading and writing.
+                    if (threadIdx.x == 0) {
+                        smem_running_prefix[state_idx] = prefix_op.running_prefix;
+                        x[(r * params.n_chunks + chunk) * params.dstate + state_idx] = prefix_op.running_prefix;
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < kNItems; ++i) {
+                        const weight_t C_val = !kIsVariableC
+                            ? BC_val[r]
+                            : (!kIsVariableB ? BC_val[r] * C_vals[i] : C_vals[i]);
+                        if constexpr (!kIsComplex) {
+                            out_vals[r][i] += thread_data[i].y * C_val;
+                        } else {
+                            out_vals[r][i] += (complex_t(thread_data[i].z, thread_data[i].w) * C_val).real_ * 2;
+                        }
                     }
                 }
             }
