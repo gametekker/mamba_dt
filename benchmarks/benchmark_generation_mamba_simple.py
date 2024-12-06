@@ -25,7 +25,7 @@ parser.add_argument("--topp", type=float, default=1.0)
 parser.add_argument("--minp", type=float, default=0.0)
 parser.add_argument("--repetition-penalty", type=float, default=1.0)
 parser.add_argument("--batch", type=int, default=1)
-args = parser.parse_args()
+args,extra = parser.parse_known_args()
 
 repeats = 3
 device = "cuda"

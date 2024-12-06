@@ -78,15 +78,24 @@ class SelectiveScanFn(torch.autograd.Function):
                 None,
                 None)
 
-
+import sys
+sys.path.append("/home/riley/mamba/mamba_dt/mlsnapshot")
+from api import MLSnapshot
+@MLSnapshot('mamba')
 def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                      return_last_state=False):
     """if return_last_state is True, returns (out, last_state)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
-    return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
-
+    y_sum = None
+    for i in range(4):
+        mh_factor = 2 ** i
+        y = SelectiveScanFn.apply(u, delta/mh_factor, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+        if return_last_state: #this implementation will return the last state of the last delta t call
+            y,prev_state=y
+        y_sum = y if y_sum is None else y_sum + y
+    return y_sum,prev_state
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                       return_last_state=False):
